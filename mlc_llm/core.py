@@ -1,20 +1,15 @@
 # pylint: disable=missing-docstring, redefined-outer-name, not-callable
 import argparse
+import functools
 import json
 import os
 import pickle
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Dict, Optional
 
+import mlc_llm
 import tvm
 import tvm.relax.backend.contrib.cublas as _
-from tvm import dlight as dl
-from tvm import relax
-from tvm.contrib.nvcc import parse_compute_version
-from tvm.relax.backend import get_patterns_with_prefix
-from tvm.relax.backend.contrib.cutlass import annotate_workspace
-
-import mlc_llm
 from mlc_llm import utils
 from mlc_llm.relax_model import (
     chatglm,
@@ -29,8 +24,20 @@ from mlc_llm.relax_model import (
     rwkv,
     stablelm_3b,
 )
-from mlc_llm.relax_model.commons import create_shard_info_func
+from mlc_llm.relax_model.commons import (
+    create_shard_info_func,
+    create_shard_transformation_func,
+)
+from mlc_llm.relax_model.param_manager import (
+    chain_parameter_transforms,
+    transform_params_for_each_rank,
+)
 from mlc_llm.transform import fuse_split_rotary_embedding, rewrite_attention
+from tvm import dlight as dl
+from tvm import relax
+from tvm.contrib.nvcc import parse_compute_version
+from tvm.relax.backend import get_patterns_with_prefix
+from tvm.relax.backend.contrib.cutlass import annotate_workspace
 
 
 @dataclass
@@ -48,75 +55,103 @@ class BuildArgs:
         The name of the model to build. If it is ``auto``, we will automatically
         set the model name according to ``--model-path``, ``hf-path``, or the model
         folders under ``--artifact-path/models``.
+
     hf_path: str
         Hugging Face path from which to download params, tokenizer, and config.
+
     quantization: str
         The quantization mode we use to compile.
+
     max_seq_len: int
         The maximum allowed sequence length for the model.
+
     target: str
         The target platform to compile the model for.
+
     db_path: str
         Path to log database for all models. Default: ``./log_db/``.
+
     reuse_lib: str
         Whether to reuse a previously generated lib.
+
     artifact_path: str
         Where to store the output.
+
     use_cache: int
         Whether to use previously pickled IRModule and skip trace.
-    convert_weight_only: bool
+
+    convert_weights_only: bool
         Whether to only convert model weights and not build the model. If both
         ``convert_weight_only`` and ``build_model_only`` are set, the behavior is undefined.
+
     build_model_only: bool
         Whether to only build model and do not convert model weights.
+
     debug_dump: bool
         Whether to dump debugging files during compilation.
+
     debug_load_script: bool
         Whether to load the script for debugging.
+
     llvm_mingw: str
         ``/path/to/llvm-mingw-root``, use llvm-mingw to cross compile to windows.
+
     system_lib: bool
         A parameter to ``relax.build``.
+
     sep_embed: bool
         Build with separated embedding layer, only applicable to LlaMa. This
         feature is in testing stage, and will be formally replaced after massive
         overhaul of embedding feature for all models and use cases.
+
     sliding_window: int
         The sliding window size in sliding window attention (SWA). This optional field
         overrides the `sliding_window` in config.json for those models that use SWA.
         Currently only useful when compiling Mistral.
-    sliding_window_chunk_size: int
-        The chunk size in sliding window attention (SWA) during prefilling. By default,
-        the chunk size is the same as sliding window. Currently only useful when compiling Mistral.
+
+    prefill_chunk_size: int
+        The chunk size during prefilling. By default, the chunk size is the same as
+        max sequence length. Currently only useful when compiling Mistral.
+
     cc_path: str
         ``/path/to/cross_compiler_path``; currently only used for cross-compile
         for nvidia/jetson device.
+
     use_safetensors: bool
         Specifies whether to use ``.safetensors`` instead of the default ``.bin``
         when loading in model weights.
+
     enable_batching: bool
         Build the model for batched inference.
         This is a temporary flag used to control the model execution flow in single-
         sequence and batching settings for now. We will eventually merge two flows
         in the future and remove this flag then.
+
     no_cutlass_attn: bool
         Disable offloading attention operations to CUTLASS.
+
     no_cutlass_norm: bool
         Disable offloading layer and RMS norm operations to CUTLASS.
+
     no_cublas: bool
         Disable the step that offloads matmul to cuBLAS. Without this flag,
         matmul will be offloaded to cuBLAS if quantization mode is ``q0f16`` or
         ``q0f32``, target is CUDA and TVM has been built with cuBLAS enabled.
+
     use_cuda_graph: bool
         Specifies whether to enable CUDA Graph for the decoder. MLP and QKV
         projection between two attention layers are put into a graph.
+
     num_shards: int
         Number of shards to split the model into in tensor parallelism multi-gpu
         inference. Only useful when ``build_model_only`` is set.
+
     use_flash_attn_mqa: bool
         Offload multi-query attention workload to Flash Attention.
+
     pdb: bool
         If set, drop into a pdb debugger on error.
+
     use_vllm_attention: bool
         Use vLLM paged KV cache and attention kernel, only relevant when enable_batching=True.
     """
@@ -145,6 +180,10 @@ class BuildArgs:
         default=-1,
         metadata={"help": "The maximum allowed sequence length for the model."},
     )
+    max_vocab_size: int = field(
+        default=40000,
+        metadata={"help": "The maximum allowed vocabulary size for the model."},
+    )
     target: str = field(
         default="auto",
         metadata={"help": "The target platform to compile the model for."},
@@ -157,11 +196,12 @@ class BuildArgs:
         default=1,
         metadata={"help": "Whether to use previously pickled IRModule and skip trace."},
     )
-    convert_weight_only: bool = field(
+    convert_weights_only: bool = field(
         default=False,
         metadata={
-            "help": "Whether to only convert model weights and not build the model.",
+            "dest": "convert_weights_only",
             "action": "store_true",
+            "help": "Whether to only convert model weights and not build the model.",
         },
     )
     build_model_only: bool = field(
@@ -235,6 +275,14 @@ class BuildArgs:
             "action": "store_true",
         },
     )
+    max_batch_size: int = field(
+        default=80,
+        metadata={
+            "help": (
+                "The maximum batch size for build. It has effect only when batching is enabled."
+            ),
+        },
+    )
     no_cutlass_attn: bool = field(
         default=False,
         metadata={
@@ -279,6 +327,13 @@ class BuildArgs:
             ),
         },
     )
+    use_presharded_weights: bool = field(
+        default=False,
+        metadata={
+            "action": "store_true",
+            "help": "Produce separate weight sets for each shard.",
+        },
+    )
     use_flash_attn_mqa: bool = field(
         default=False,
         metadata={
@@ -296,12 +351,12 @@ class BuildArgs:
             ),
         },
     )
-    sliding_window_chunk_size: int = field(
+    prefill_chunk_size: int = field(
         default=-1,
         metadata={
             "help": (
-                "The chunk size in sliding window attention (SWA) during prefilling. "
-                "By default, the chunk size is the same as sliding window. "
+                "The chunk size during prefilling. By default, the chunk size is "
+                "the same as the sliding window size or the max sequence length. "
                 "Currently only useful when compiling Mistral."
             ),
         },
@@ -324,6 +379,11 @@ class BuildArgs:
         },
     )
 
+    @property
+    def convert_weight_only(self):
+        """A backwards-compatibility helper"""
+        return self.convert_weights_only
+
 
 def convert_build_args_to_argparser() -> argparse.ArgumentParser:
     """Convert from BuildArgs to an equivalent ArgumentParser."""
@@ -338,6 +398,20 @@ def convert_build_args_to_argparser() -> argparse.ArgumentParser:
             args.add_argument(field_name, default=field.default, **kwargs)
         else:
             args.add_argument(field_name, type=field.type, default=field.default, **kwargs)
+
+    # Most models contain more than a single parameter (citation
+    # needed), so "weights" should be plural.  The initial use of
+    # "--convert-weight-only" caused enough typos that it is worth
+    # fixing.  The old argument spelling is retained for backwards
+    # compatibility.
+    args.add_argument(
+        "--convert-weight-only",
+        default=False,
+        dest="convert_weights_only",
+        action="store_true",
+        help="Equivalent to --convert-weights-only, retained for backwards compatibility.",
+    )
+
     return args
 
 
@@ -366,9 +440,14 @@ def _parse_args(parsed) -> argparse.Namespace:
             "tvm.contrib.vllm.single_query_cached_kv_attention", True
         ), "TVM needs to be built with -DUSE_VLLM=ON."
 
-    parsed.artifact_path = os.path.join(
-        parsed.artifact_path, f"{parsed.model}-{parsed.quantization.name}"
-    )
+    model_name = [
+        parsed.model,
+        parsed.quantization.name,
+    ]
+    if parsed.use_presharded_weights:
+        model_name.append(f"presharded-{parsed.num_shards}gpu")
+
+    parsed.artifact_path = os.path.join(parsed.artifact_path, "-".join(model_name))
 
     return parsed
 
@@ -483,7 +562,12 @@ def mod_transform_before_build(
     mod = param_manager.transform_dequantize()(mod)
     mod = relax.transform.BundleModelParams()(mod)
 
-    use_ft_quant = args.quantization.name in ["q4f16_ft", "q8f16_ft"]
+    use_ft_quant = args.quantization.name in [
+        "q4f16_ft",
+        "q8f16_ft",
+        "q4f16_ft_group",
+        "q8f16_ft_group",
+    ]
     mod = mlc_llm.transform.FuseDecodeTranspose(skip_gemm=not use_ft_quant)(mod)
 
     if (
@@ -602,6 +686,7 @@ def dump_mlc_chat_config(
     config["mean_gen_len"] = mean_gen_len
     config["max_gen_len"] = max_gen_len
     config["num_shards"] = args.num_shards
+    config["use_presharded_weights"] = args.use_presharded_weights
     config["shift_fill_factor"] = shift_fill_factor
     if rwkv_world:
         config["tokenizer_files"] = ["tokenizer_model"]
@@ -610,10 +695,10 @@ def dump_mlc_chat_config(
     config["model_category"] = args.model_category
     config["model_name"] = args.model
     config["vocab_size"] = vocab_size
+    config["prefill_chunk_size"] = args.prefill_chunk_size
     if args.sliding_window != -1:
         # Do not add max window size if use sliding window
         config["sliding_window"] = args.sliding_window
-        config["sliding_window_chunk_size"] = args.sliding_window_chunk_size
     else:
         config["max_window_size"] = max_window_size
 
@@ -652,6 +737,7 @@ def build(mod_deploy: tvm.IRModule, args: argparse.Namespace) -> None:
                     mod_deploy
                 )
             )
+        if not args.enable_batching:
             mod_deploy = tvm.tir.transform.ForceNarrowIndexToInt32()(mod_deploy)
 
     if args.debug_load_script:
@@ -684,7 +770,7 @@ def build_model_from_args(args: argparse.Namespace):
             "and it is highly recommended to use q4f16_1 instead"
         )
     if args.num_shards > 1:
-        if (not args.build_model_only) and (not args.convert_weight_only):
+        if (not args.build_model_only) and (not args.convert_weights_only):
             raise ValueError(
                 "`num_shards` should be used together with "
                 "`--build-model-only` and `--convert-weight-only`"
@@ -708,7 +794,7 @@ def build_model_from_args(args: argparse.Namespace):
         with open(os.path.join(args.model_path, "config.json"), encoding="utf-8") as i_f:
             config = json.load(i_f)
 
-    if not use_cache or args.convert_weight_only:
+    if not use_cache or args.convert_weights_only:
         model_generators = {
             "llama": llama,
             "mistral": mistral,
@@ -734,19 +820,54 @@ def build_model_from_args(args: argparse.Namespace):
 
         if args.model_category == "mistral":
             args.sliding_window = model_config.sliding_window
-            args.sliding_window_chunk_size = model_config.sliding_window_chunk_size
 
         for qspec_updater_class in param_manager.qspec_updater_classes:
             qspec_updater = qspec_updater_class(param_manager)
             qspec_updater.visit_module(mod)
 
         if not args.build_model_only:
+            parameter_transforms = []
+
             # Run pre-quantization if provided.
             args.model_path = param_manager.run_pre_quantize(args.model_path)
             param_manager.init_torch_pname_to_bin_name(args.use_safetensors)
+            parameter_transforms.append(param_manager.create_parameter_transformation())
 
-            new_params = utils.convert_weights(param_manager, params, args)
-            utils.save_params(new_params, args.artifact_path)
+            # Run pre-sharding if required
+            if args.num_shards > 1 and args.use_presharded_weights:
+                mod_shard = create_shard_transformation_func(param_manager, args, model_config)
+                mod_shard = transform_params_for_each_rank(mod_shard, num_shards=args.num_shards)
+                parameter_transforms.append(mod_shard)
+
+            # Chain all parameter transforms together.  This allows
+            # ReorderTransformFunc to be applied to the single
+            # resulting parameter transformation function.
+            mod_transform = functools.reduce(chain_parameter_transforms, parameter_transforms)
+
+            seq = tvm.ir.transform.Sequential(
+                [
+                    relax.transform.CanonicalizeBindings(),
+                    relax.transform.EliminateCommonSubexpr(),
+                    relax.transform.DeadCodeElimination(),
+                    # TODO(Lunderberg): Implement
+                    # relax.transform.Simplify() that applies
+                    # canonicalization, CSE, and DCE until
+                    # convergence.
+                    relax.transform.CanonicalizeBindings(),
+                    relax.transform.EliminateCommonSubexpr(),
+                    relax.transform.DeadCodeElimination(),
+                    param_manager.optimize_transform_param_order(),
+                ],
+                name="SimplifyModTransform",
+            )
+
+            mod_transform = seq(mod_transform)
+
+            params = utils.convert_weights(mod_transform, param_manager, params, args)
+            utils.save_params(
+                params, args.artifact_path, args.num_shards if args.use_presharded_weights else 1
+            )
+
             if args.model_category != "minigpt":
                 utils.copy_tokenizer(args)
             if args.model_category == "rwkv" or args.model_category == "rwkv_world":
@@ -755,24 +876,39 @@ def build_model_from_args(args: argparse.Namespace):
                     args,
                     vocab_size=config["vocab_size"],
                     max_window_size=model_config.max_sequence_length,
+                    max_gen_len=model_config.max_sequence_length,
                     top_p=0.6,
                     temperature=1.2,
                     repetition_penalty=0.996,
                     rwkv_world=True,
+                )
+            elif args.model_category == "chatglm":
+                dump_mlc_chat_config(
+                    args,
+                    vocab_size=config["padded_vocab_size"],
+                    max_window_size=model_config.max_sequence_length,
+                    max_gen_len=model_config.max_sequence_length,
                 )
             else:
                 dump_mlc_chat_config(
                     args,
                     vocab_size=config["vocab_size"],
                     max_window_size=model_config.max_sequence_length,
+                    max_gen_len=model_config.max_sequence_length,
                 )
 
-        if args.convert_weight_only:
+        if args.convert_weights_only:
             exit(0)
 
         mod = mod_transform_before_build(mod, param_manager, args, model_config)
         if args.num_shards > 1:
-            create_shard_info_func(mod, param_manager, args, model_config)
+            # We require a "create_sharding_info" function for all
+            # multi-GPU models, even if they are using pre-sharded
+            # weights.  When using pre-sharded weights, the list of
+            # initialization-time transforms to apply is empty.
+            sharding_module = create_shard_info_func(param_manager, args, model_config)
+            mod.update(sharding_module)
+
         with open(cache_path, "wb") as outfile:
             pickle.dump(mod, outfile)
         print(f"Save a cached module to {cache_path}.")

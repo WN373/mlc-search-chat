@@ -52,39 +52,49 @@ def _attach_auxiliary_methods(
     mod: IRModule,
     named_params: List[Tuple[str, nn.Parameter]],
     args: CompileArgs,
-    model_config,
 ) -> None:
-    def _metadata():
-        metadata = {
-            "quantization": args.quantization.name,
-            "model_type": args.model.name,
-            "params": [
-                {
-                    "name": name,
-                    "shape": list(param.shape),
-                    "dtype": param.dtype,
-                }
-                for name, param in named_params
-            ],
-        }
+    def _get_memory_usage():
+        return {str(k): int(v) for k, v in mod.attrs["mlc_llm.memory_usage"].items()}
+
+    def _get_param_info():
+        return [
+            {
+                "name": name,
+                "shape": list(param.shape),
+                "dtype": param.dtype,
+            }
+            for name, param in named_params
+        ]
+
+    def _emit_metadata(metadata):
         bb = relax.BlockBuilder()  # pylint: disable=invalid-name
         with bb.function("main", params=[]):
             bb.emit_func_output(relax.StringImm(json.dumps(metadata)))
         return bb.get()["main"]
 
-    def _attach_variable_bounds():
-        for g_var, func in mod.functions_items():
-            if isinstance(func, relax.Function):
-                mod[g_var] = func.with_attr(
-                    "tir_var_upper_bound",
-                    {
-                        "seq_len": model_config.max_sequence_length,
-                        "total_seq_len": model_config.max_sequence_length,
-                    },
-                )
+    mod["_metadata"] = _emit_metadata(
+        metadata={
+            "quantization": args.quantization.name,
+            "model_type": args.model.name,
+            "memory_usage": _get_memory_usage(),
+            "params": _get_param_info(),
+        }
+    )
 
-    mod["_metadata"] = _metadata()
-    _attach_variable_bounds()
+
+def _attach_variable_bounds(mod, model_config):
+    tir_bound_map = {}
+    tir_bound_map["seq_len"] = model_config.prefill_chunk_size
+
+    if hasattr(model_config, "sliding_window"):
+        tir_bound_map["rolling_cache_len"] = model_config.sliding_window
+        tir_bound_map["kv_seq_len"] = model_config.sliding_window + model_config.prefill_chunk_size
+    else:
+        tir_bound_map["total_seq_len"] = model_config.context_window_size
+
+    for g_var, func in mod.functions_items():
+        if isinstance(func, relax.Function):
+            mod[g_var] = func.with_attr("tir_var_upper_bound", tir_bound_map)
 
 
 def _compile(args: CompileArgs):
@@ -96,10 +106,11 @@ def _compile(args: CompileArgs):
     mod, named_params = model.export_tvm(
         spec=model.get_default_spec(),  # type: ignore
     )
-    _attach_auxiliary_methods(mod, named_params, args, model_config)
     logger.info("Running optimizations using TVM Unity")
+    _attach_variable_bounds(mod, model_config)
     with args.target:
         mod = relax.get_pipeline("mlc_llm")(mod)
+    _attach_auxiliary_methods(mod, named_params, args)
     logger.info("Generating code using TVM Unity")
     args.build_func(mod, args)
     logger.info("Generated: %s", bold(str(args.output)))
@@ -114,7 +125,9 @@ def compile(  # pylint: disable=too-many-arguments,redefined-builtin
     build_func: Callable[[IRModule, CompileArgs], None],
     prefix_symbols: str,
     output: Path,
-    max_sequence_length: Optional[int],
+    context_window_size: Optional[int],
+    sliding_window: Optional[int],
+    prefill_chunk_size: Optional[int],
 ):
     """Compile a model given its configuration and quantization format to a specific target."""
     args = CompileArgs(
@@ -126,7 +139,11 @@ def compile(  # pylint: disable=too-many-arguments,redefined-builtin
         build_func,
         prefix_symbols,
         output,
-        ModelConfigOverride(max_sequence_length=max_sequence_length),
+        ModelConfigOverride(
+            context_window_size=context_window_size,
+            sliding_window=sliding_window,
+            prefill_chunk_size=prefill_chunk_size,
+        ),
     )
     args.display()
     _compile(args)

@@ -3,13 +3,12 @@ import logging
 import os
 from typing import TYPE_CHECKING, Callable, Optional, Tuple
 
-import tvm
 from tvm import IRModule, relax
 from tvm._ffi import get_global_func, register_func
 from tvm.contrib import tar, xcode
-from tvm.runtime import Device
 from tvm.target import Target
 
+from .auto_device import AUTO_DETECT_DEVICES, _device_to_str, detect_device
 from .style import bold, green, red
 
 if TYPE_CHECKING:
@@ -19,7 +18,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # TODO: add help message on how to specify the target manually # pylint: disable=fixme
-# TODO: include host detection logic below after the new TVM build is done. # pylint: disable=fixme
 HELP_MSG = """TBD"""
 FOUND = green("Found")
 NOT_FOUND = red("Not found")
@@ -46,50 +44,26 @@ def detect_target_and_host(target_hint: str, host_hint: str = "auto") -> Tuple[T
     return target, build_func
 
 
-def detect_device(device_hint: str) -> Device:
-    """Detect locally available device from string hint."""
-    if device_hint == "auto":
-        device = None
-        for device_type in AUTO_DETECT_DEVICES:
-            cur_device = tvm.device(dev_type=device_type, dev_id=0)
-            if cur_device.exist:
-                logger.info("%s device: %s:0", FOUND, device_type)
-                if device is None:
-                    device = cur_device
-            else:
-                logger.info("%s device: %s:0", NOT_FOUND, device_type)
-        if device is None:
-            logger.info("%s: No available device detected. Falling back to CPU", NOT_FOUND)
-            return tvm.device("cpu:0")
-        device_str = f"{tvm.runtime.Device.MASK2STR[device.device_type]}:{device.device_id}"
-        logger.info("Using device: %s. Use `--device` to override.", bold(device_str))
-        return device
-    try:
-        device = tvm.device(device_hint)
-    except Exception as err:
-        raise ValueError(f"Invalid device name: {device_hint}") from err
-    if not device.exist:
-        raise ValueError(f"Device is not found on your local environment: {device_hint}")
-    return device
-
-
 def _detect_target_gpu(hint: str) -> Tuple[Target, BuildFunc]:
     if hint in ["iphone", "android", "webgpu", "mali", "opencl"]:
         hint += ":generic"
-    if hint == "auto":
-        logger.info("Detecting potential target devices: %s", ", ".join(AUTO_DETECT_DEVICES))
+    if hint == "auto" or hint in AUTO_DETECT_DEVICES:
         target: Optional[Target] = None
-        for device in AUTO_DETECT_DEVICES:
-            device_target = _detect_target_from_device(device + ":0")
-            if device_target is not None and target is None:
-                target = device_target
+        device = detect_device(hint)
+        if device is not None:
+            device_str = _device_to_str(device)
+            try:
+                target = Target.from_device(device)
+            except ValueError:
+                logger.info("%s: Cannot detect target from device: %s", NOT_FOUND, device_str)
         if target is None:
-            raise ValueError("No GPU target detected. Please specify explicitly")
-        return target, _build_default()
-    if hint in AUTO_DETECT_DEVICES:
-        target = _detect_target_from_device(hint + ":0")
-        if target is None:
-            raise ValueError(f"No GPU target detected from device: {hint}")
+            raise ValueError(f"No target detected from device: {hint}. Please specify explicitly")
+        logger.info(
+            '%s configuration of target device "%s": %s',
+            FOUND,
+            bold(device_str),
+            target.export(),
+        )
         return target, _build_default()
     if hint in PRESET:
         preset = PRESET[hint]
@@ -115,7 +89,10 @@ def _detect_target_host(hint: str) -> Target:
     """Detect the host CPU architecture."""
     if hint == "auto":
         target_triple = get_global_func("tvm.codegen.llvm.GetDefaultTargetTriple")()
-        logger.info("%s host CPU architecture: %s", FOUND, bold(target_triple))
+        logger.info("%s host LLVM triple: %s", FOUND, bold(target_triple))
+    else:
+        target_triple = hint
+        logger.info("Using LLVM triple specified by --host: %s", bold(target_triple))
     return Target({"kind": "llvm", "mtriple": target_triple})
 
 
@@ -141,21 +118,6 @@ def _add_prefix_symbol(mod: IRModule, prefix: str, is_system_lib: bool) -> IRMod
             "when building the shared library"
         )
     return mod
-
-
-def _detect_target_from_device(device: str) -> Optional[Target]:
-    try:
-        target = Target.from_device(device)
-    except ValueError:
-        logger.info("%s: target device: %s", NOT_FOUND, device)
-        return None
-    logger.info(
-        '%s configuration of target device "%s": %s',
-        FOUND,
-        bold(device),
-        target.export(),
-    )
-    return target
 
 
 def _build_metal_x86_64():
@@ -284,8 +246,6 @@ def _register_cuda_hook(target: Target):
             ptx = nvcc.compile_cuda(code, target_format="fatbin", arch=arch)
         return ptx
 
-
-AUTO_DETECT_DEVICES = ["cuda", "rocm", "metal", "vulkan"]
 
 PRESET = {
     "iphone:generic": {

@@ -84,6 +84,8 @@ def detect_weight(
         weight_config_path = check_func(weight_path)
         if not weight_config_path:
             raise ValueError(f"The weight is not in {weight_format} format.")
+    else:
+        weight_config_path = weight_path
     return weight_config_path, weight_format
 
 
@@ -121,6 +123,16 @@ def _check_pytorch(weight_path: Path) -> Optional[Path]:
             pytorch_json_path,
         )
         return pytorch_json_path
+
+    pytorch_file_path = weight_path / "pytorch_model.bin"
+    if pytorch_file_path.exists():
+        logger.info(
+            "%s source weight format: huggingface-torch. Source configuration: %s",
+            FOUND,
+            pytorch_file_path,
+        )
+        return pytorch_file_path
+
     logger.info("%s Huggingface PyTorch", NOT_FOUND)
     return None
 
@@ -143,5 +155,5 @@ CHECK_FORMAT_METHODS = {
     "huggingface-safetensor": _check_safetensor,
 }
 
-# "awq", "ggml", "gguf" are not supported yet.
-AVAILABLE_WEIGHT_FORMAT = ["huggingface-torch", "huggingface-safetensor"]
+# "ggml", "gguf" are not supported yet.
+AVAILABLE_WEIGHT_FORMAT = ["huggingface-torch", "huggingface-safetensor", "awq"]

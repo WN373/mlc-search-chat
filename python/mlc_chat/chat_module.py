@@ -8,13 +8,17 @@ import sys
 import warnings
 from dataclasses import asdict, dataclass, fields
 from enum import Enum
-from typing import List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import tvm
 from tvm.runtime import disco  # pylint: disable=unused-import
 
+from mlc_chat.support.auto_device import detect_device
+
 from . import base  # pylint: disable=unused-import
-from .interface.openai_api import ChatMessage
+
+if TYPE_CHECKING:
+    from .interface.openai_api import ChatMessage
 
 # pylint: disable=line-too-long
 _PYTHON_GET_STARTED_TUTORIAL_URL = "https://github.com/mlc-ai/notebooks/blob/main/mlc-llm/tutorial_chat_module_getting_started.ipynb"
@@ -41,10 +45,10 @@ class ConvConfig:  # pylint: disable=too-many-instance-attributes
     roles : Optional[List[str]]
         An array that describes the role names of the user and the model. These
         names are specific to the model being used.
-    messages : Optional[List[str]]
+    messages : Optional[List[List[str]]]
         The chat history represented as an array of string pairs in the following
         format: ``[[role_0, msg_0], [role_1, msg_1], ...]``.
-    offset : Optional[str]
+    offset : Optional[int]
         The offset used to begin the chat from the chat history. When offset
         is not ``0``, ``messages[0:offset-1]`` will be encoded.
     separator_style : Optional[int]
@@ -60,6 +64,8 @@ class ConvConfig:  # pylint: disable=too-many-instance-attributes
         When the ``stop_str`` is encountered, the model will stop generating output.
     stop_tokens : Optional[List[int]]
         A list of token IDs that act as stop tokens.
+    prefix_tokens : Optional[List[int]]
+        Token list prefixing the conversation.
     add_bos : Optional[bool]
         Determines whether a beginning-of-string (bos) token should be added
         before the input tokens.
@@ -69,13 +75,14 @@ class ConvConfig:  # pylint: disable=too-many-instance-attributes
     system: Optional[str] = None
     roles: Optional[List[str]] = None
     messages: Optional[List[List[str]]] = None
-    offset: Optional[str] = None
+    offset: Optional[int] = None
     separator_style: Optional[int] = None
     seps: Optional[List[str]] = None
     role_msg_sep: Optional[str] = None
     role_empty_sep: Optional[str] = None
     stop_str: Optional[str] = None
     stop_tokens: Optional[List[int]] = None
+    prefix_tokens: Optional[List[int]] = None
     add_bos: Optional[bool] = None
 
     def __post_init__(self):
@@ -151,6 +158,8 @@ class ChatConfig:  # pylint: disable=too-many-instance-attributes
         Name of the model (e.g. ``Llama-2-7b-chat-hf``).
     num_shards: Optional[str]
         Tensor parallel degree.
+    use_presharded_weights: Optional[bool]
+        If True, the weights were saved with sharding already applied.
     max_window_size: Optional[str]
         Maximum kv cache window size.
     """
@@ -169,6 +178,7 @@ class ChatConfig:  # pylint: disable=too-many-instance-attributes
     model_category: Optional[str] = None
     model_name: Optional[str] = None
     num_shards: Optional[int] = None
+    use_presharded_weights: Optional[bool] = None
     max_window_size: Optional[int] = None
 
     @classmethod
@@ -583,89 +593,6 @@ def _convert_generation_config_to_json_str(generation_config: Optional[Generatio
     return json.dumps(asdict(generation_config))
 
 
-def _parse_device_str(device: str) -> Tuple[tvm.runtime.Device, str]:
-    """Parse the input device identifier into device name and id.
-
-    Parameters
-    ----------
-    device : str
-        The device identifier to parse.
-        It can be "device_name" (e.g., "cuda") or
-        "device_name:device_id" (e.g., "cuda:1").
-
-    Returns
-    -------
-    dev : tvm.runtime.Device
-        The device.
-
-    device_name : str
-        The name of the device.
-    """
-    device_err_msg = (
-        f"Invalid device name: {device}. Please enter the device in the form "
-        "'device_name:device_id' or 'device_name', where 'device_name' needs to be "
-        "one of 'cuda', 'metal', 'vulkan', 'rocm', 'opencl', 'auto'."
-    )
-    device_args = device.split(":")
-    if len(device_args) == 1:
-        device_name, device_id = device_args[0], 0
-    elif len(device_args) == 2:
-        device_name, device_id = device_args[0], int(device_args[1])
-    elif len(device_args) > 2:
-        raise ValueError(device_err_msg)
-
-    if device_name == "cuda":
-        device = tvm.cuda(device_id)
-    elif device_name == "metal":
-        device = tvm.metal(device_id)
-    elif device_name == "vulkan":
-        device = tvm.vulkan(device_id)
-    elif device_name == "rocm":
-        device = tvm.rocm(device_id)
-    elif device_name == "opencl":
-        device = tvm.opencl(device_id)
-    elif device_name == "auto":
-        device, device_name = _detect_local_device(device_id)
-        logging.info("System automatically detected device: %s", device_name)
-    else:
-        raise ValueError(device_err_msg)
-
-    return device, device_name
-
-
-def _detect_local_device(device_id: int = 0) -> Tuple[tvm.runtime.Device, str]:
-    """Automatically detect the local device if user does not specify.
-
-    Parameters
-    ----------
-    device_id : int
-        The local device id.
-
-    Returns
-    ------
-    dev : tvm.runtime.Device
-        The local device.
-
-    device_name : str
-        The name of the device.
-    """
-    if tvm.metal().exist:
-        return tvm.metal(device_id), "metal"
-    if tvm.rocm().exist:
-        return tvm.rocm(device_id), "rocm"
-    if tvm.cuda().exist:
-        return tvm.cuda(device_id), "cuda"
-    if tvm.vulkan().exist:
-        return tvm.vulkan(device_id), "vulkan"
-    if tvm.opencl().exist:
-        return tvm.opencl(device_id), "opencl"
-    logging.info(
-        "None of the following device is detected: metal, rocm, cuda, vulkan, opencl. "
-        "Switch to llvm instead."
-    )
-    return tvm.cpu(device_id), "llvm"
-
-
 class ChatModule:  # pylint: disable=too-many-instance-attributes
     r"""The ChatModule for MLC LLM.
 
@@ -730,7 +657,7 @@ class ChatModule:  # pylint: disable=too-many-instance-attributes
     ):
         # 0. Get device:
         # Retrieve device_name and device_id (if any, default 0) from device arg
-        self.device, device_name = _parse_device_str(device)
+        self.device = detect_device(device)
         device_type = self.device.device_type
         device_id = self.device.device_id
 
@@ -772,7 +699,7 @@ class ChatModule:  # pylint: disable=too-many-instance-attributes
             self.model_path,
             self.chat_config,
             model_lib_path,
-            device_name,
+            self.device.MASK2STR[self.device.device_type],
             self.config_file_path,
         )
 
@@ -784,7 +711,7 @@ class ChatModule:  # pylint: disable=too-many-instance-attributes
 
     def generate(
         self,
-        prompt: Union[str, List[ChatMessage]],
+        prompt: Union[str, List["ChatMessage"]],
         generation_config: Optional[GenerationConfig] = None,
         progress_callback=None,
     ) -> Union[str, List[str]]:
@@ -842,8 +769,6 @@ class ChatModule:  # pylint: disable=too-many-instance-attributes
         if (generation_config is not None) and (generation_config.n is not None):
             num_return_sequences = generation_config.n
             return_str = False
-        else:
-            num_return_sequences = 1
 
         for _ in range(num_return_sequences):
             self.reset_chat()
@@ -1002,7 +927,7 @@ class ChatModule:  # pylint: disable=too-many-instance-attributes
 
     def _prefill(
         self,
-        input: Union[str, List[ChatMessage]],  # pylint: disable=redefined-builtin
+        input: Union[str, List["ChatMessage"]],  # pylint: disable=redefined-builtin
         decode_next_token: bool = True,
         place_in_prompt: PlaceInPrompt = PlaceInPrompt.All,
         generation_config: Optional[GenerationConfig] = None,
