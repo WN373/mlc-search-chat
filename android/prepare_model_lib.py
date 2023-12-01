@@ -14,6 +14,8 @@ def main():
         if not os.path.isfile(path):
             raise RuntimeError(f"Cannot find {path}")
         tar_list.append(path)
+        print(path)
+        print(os.path.exists(path))
 
     ndk.create_staticlib(os.path.join("build", "model_lib", "libmodel_android.a"), tar_list)
     print(f"Creating lib from {tar_list}..")

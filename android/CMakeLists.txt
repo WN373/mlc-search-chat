@@ -15,6 +15,13 @@ if (NOT DEFINED TVM_HOME)
 endif (NOT DEFINED TVM_HOME)
 message(STATUS "TVM_HOME: ${TVM_HOME}")
 
+set(JAVA_HOME "C:/Users/Xjchen/.jdks/openjdk-18.0.2.1")
+set(JAVA_INCLUDE_PATH "${JAVA_HOME}/include")
+set(JAVA_INCLUDE_PATH2 "${JAVA_HOME}/include/win32")
+set(JAVA_AWT_INCLUDE_PATH "${JAVA_INCLUDE_PATH}")
+set(JAVA_AWT_LIBRARY "${JAVA_HOME}/bin/awt.dll")
+set(JAVA_JVM_LIBRARY "${JAVA_HOME}/jre/bin/server/jvm.dll")
+
 find_package(Java REQUIRED)
 find_package(JNI REQUIRED)
 if (JNI_FOUND)

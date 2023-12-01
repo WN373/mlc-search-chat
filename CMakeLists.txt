@@ -130,8 +130,9 @@ endif()
 if (MLC_LLM_INSTALL_STATIC_LIB)
   target_link_libraries(
     mlc_chat_cli PRIVATE mlc_llm_static tokenizers_cpp sentencepiece-static tokenizers_c)
-  target_link_libraries(
-    mlc_chat_cli PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,tvm_runtime>")
+  target_link_libraries(mlc_chat_cli PRIVATE mlc_llm_static sentencepiece-static tokenizers tvm_runtime)
+  #target_link_libraries(
+  #  mlc_chat_cli PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,tvm_runtime>")
 else()
   target_link_libraries(mlc_chat_cli PUBLIC mlc_llm)
 endif()
